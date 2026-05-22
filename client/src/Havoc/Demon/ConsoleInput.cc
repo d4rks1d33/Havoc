@@ -202,21 +202,25 @@ auto DemonCommands::DispatchCommand( bool Send, QString TaskID, const QString& c
     auto AgentData     = ServiceAgent();
 
     // check if it's a generic demon or 3rd party agent
+    // POSIX agents use a per-build random magic value (not 0xDEADBEEF) for
+    // evasion. They are still Demon-compatible agents — treat them as Demon
+    // unless their magic is registered as a service agent.
 
-    if ( MagicValue == DemonMagicValue )
+    bool isServiceAgent = false;
+    for ( auto& agent : HavocX::Teamserver.ServiceAgents )
     {
-        IsDemonAgent = true;
-    }
-    else
-    {
-        for ( auto& agent : HavocX::Teamserver.ServiceAgents )
+        if ( MagicValue == agent.MagicValue )
         {
-            if ( MagicValue == agent.MagicValue )
-            {
-                AgentData = agent;
-                AgentTypeName = agent.Name;
-            }
+            AgentData     = agent;
+            AgentTypeName = agent.Name;
+            isServiceAgent = true;
         }
+    }
+
+    if ( MagicValue == DemonMagicValue || ! isServiceAgent )
+    {
+        // Default Demon (0xDEADBEEF) OR POSIX agent with custom magic
+        IsDemonAgent = true;
     }
 
     if ( IsDemonAgent )
