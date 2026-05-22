@@ -140,7 +140,14 @@ void DemonInteracted::setupUi( QWidget *Form )
     label->setStyleSheet("padding-bottom: 3px;"
                          "padding-left: 5px;");
 
-    if ( SessionInfo.MagicValue == DemonMagicValue )
+    // Check if this is a Demon-compatible agent (default magic or POSIX custom magic)
+    bool isServiceAgentUI = false;
+    for ( auto& agent : HavocX::Teamserver.ServiceAgents ) {
+        if ( SessionInfo.MagicValue == (u64)agent.MagicValue ) { isServiceAgentUI = true; break; }
+    }
+    bool isDemonCompatible = ( SessionInfo.MagicValue == DemonMagicValue ) || ! isServiceAgentUI;
+
+    if ( isDemonCompatible )
     {
         for ( auto& i : HavocSpace::DemonCommands::DemonCommandList )
         {
@@ -240,7 +247,13 @@ void DemonInteracted::AppendText( const QString& text )
         auto AgentData   = ServiceAgent();
         auto HelpCommand = false;
 
-        if ( DemonCommands->MagicValue != DemonMagicValue )
+        // For POSIX agents with custom magic: check service agents first,
+        // but fall back to Demon dispatch if not a registered service agent.
+        bool isSvcAgent = false;
+        for ( auto& agent : HavocX::Teamserver.ServiceAgents ) {
+            if ( DemonCommands->MagicValue == (u64)agent.MagicValue ) { isSvcAgent = true; break; }
+        }
+        if ( isSvcAgent )
         {
             for ( auto& agent : HavocX::Teamserver.ServiceAgents )
             {
