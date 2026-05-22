@@ -1,15 +1,15 @@
 package handlers
 
 import (
-	"bytes"
-	//"encoding/hex"
-	"fmt"
-	"math/bits"
+        "bytes"
+        //"encoding/hex"
+        "fmt"
+        "math/bits"
 
-	"Havoc/pkg/agent"
-	"Havoc/pkg/common/packer"
-	"Havoc/pkg/common/parser"
-	"Havoc/pkg/logger"
+        "Havoc/pkg/agent"
+        "Havoc/pkg/common/packer"
+        "Havoc/pkg/common/parser"
+        "Havoc/pkg/logger"
 )
 
 // parseAgentRequest
@@ -18,330 +18,345 @@ import (
 // Response is the data/bytes once this function finished parsing the request.
 // Success is if the function was successful while parsing the agent request.
 //
-//	Response byte.Buffer
-//	Success	 bool
+//      Response byte.Buffer
+//      Success  bool
 func parseAgentRequest(Teamserver agent.TeamServer, Body []byte, ExternalIP string) (bytes.Buffer, bool) {
 
-	var (
-		Header   agent.Header
-		Response bytes.Buffer
-		err      error
-	)
+        var (
+                Header   agent.Header
+                Response bytes.Buffer
+                err      error
+        )
 
-	Header, err = agent.ParseHeader(Body)
-	if err != nil {
-		logger.Debug("[Error] Header: " + err.Error())
-		return Response, false
-	}
+        Header, err = agent.ParseHeader(Body)
+        if err != nil {
+                logger.Debug("[Error] Header: " + err.Error())
+                return Response, false
+        }
 
-	if Header.Data.Length() < 4 {
-		return Response, false
-	}
+        if Header.Data.Length() < 4 {
+                return Response, false
+        }
 
-	// handle this demon connection if the magic value matches
-	if Header.MagicValue == agent.DEMON_MAGIC_VALUE {
-		return handleDemonAgent(Teamserver, Header, ExternalIP)
-	}
+        // Handle as a Demon agent if:
+        //   1. The magic value is the default 0xDEADBEEF (Windows Demon), OR
+        //   2. The agent is already registered (POSIX agents use per-build random magic), OR
+        //   3. The magic value is non-zero and not registered as a service agent
+        //      (new POSIX registration with custom magic)
+        isDefault := Header.MagicValue == agent.DEMON_MAGIC_VALUE
+        isKnown   := Teamserver.AgentExist(Header.AgentID)
+        isService := Teamserver.ServiceAgentExist(Header.MagicValue)
 
-	// If it's not a Demon request then try to see if it's a 3rd party agent.
-	return handleServiceAgent(Teamserver, Header, ExternalIP)
+
+
+        if isDefault || isKnown || !isService {
+                return handleDemonAgent(Teamserver, Header, ExternalIP)
+        }
+
+        // Registered service agent with matching magic.
+        return handleServiceAgent(Teamserver, Header, ExternalIP)
 }
 
 // handleDemonAgent
 // parse the demon agent request
 // return 2 types:
 //
-//	Response bytes.Buffer
-//	Success  bool
+//      Response bytes.Buffer
+//      Success  bool
 func handleDemonAgent(Teamserver agent.TeamServer, Header agent.Header, ExternalIP string) (bytes.Buffer, bool) {
 
-	var (
-		Agent     *agent.Agent
-		Response  bytes.Buffer
-		RequestID uint32
-		Command   uint32
-		Packer    *packer.Packer
-		Build     []byte
-		err       error
-	)
+        var (
+                Agent     *agent.Agent
+                Response  bytes.Buffer
+                RequestID uint32
+                Command   uint32
+                Packer    *packer.Packer
+                Build     []byte
+                err       error
+        )
 
-	/* check if the agent exists. */
-	if Teamserver.AgentExist(Header.AgentID) {
+        /* check if the agent exists. */
+        if Teamserver.AgentExist(Header.AgentID) {
 
-		/* get our agent instance based on the agent id */
-		Agent = Teamserver.AgentInstance(Header.AgentID)
-		Agent.UpdateLastCallback(Teamserver)
+                /* get our agent instance based on the agent id */
+                Agent = Teamserver.AgentInstance(Header.AgentID)
+                Agent.UpdateLastCallback(Teamserver)
 
-		// while we can read a command and request id, parse new packages
-		first_iter := true
-		asked_for_jobs := false
-		for (Header.Data.CanIRead(([]parser.ReadType{parser.ReadInt32, parser.ReadInt32}))) {
-			Command   = uint32(Header.Data.ParseInt32())
-			RequestID = uint32(Header.Data.ParseInt32())
+                // while we can read a command and request id, parse new packages
+                first_iter := true
+                asked_for_jobs := false
+                for (Header.Data.CanIRead(([]parser.ReadType{parser.ReadInt32, parser.ReadInt32}))) {
+                        Command   = uint32(Header.Data.ParseInt32())
+                        RequestID = uint32(Header.Data.ParseInt32())
 
-			/* check if this is a 'reconnect' request */
-			if Command == agent.DEMON_INIT {
-				logger.Debug(fmt.Sprintf("Agent: %x, Command: DEMON_INIT", Header.AgentID))
-				Packer = packer.NewPacker(Agent.Encryption.AESKey, Agent.Encryption.AESIv)
-				Packer.AddUInt32(uint32(Header.AgentID))
+                        /* check if this is a 'reconnect' request */
+                        if Command == agent.DEMON_INIT {
+                                logger.Debug(fmt.Sprintf("Agent: %x, Command: DEMON_INIT", Header.AgentID))
+                                Packer = packer.NewPacker(Agent.Encryption.AESKey, Agent.Encryption.AESIv)
+                                Packer.AddUInt32(uint32(Header.AgentID))
 
-				Build = Packer.Build()
+                                Build = Packer.Build()
 
-				_, err = Response.Write(Build)
-				if err != nil {
-					logger.Error(err)
-					return Response, false
-				}
-				logger.Debug(fmt.Sprintf("reconnected %x", Build))
-				return Response, true
-			}
+                                _, err = Response.Write(Build)
+                                if err != nil {
+                                        logger.Error(err)
+                                        return Response, false
+                                }
+                                logger.Debug(fmt.Sprintf("reconnected %x", Build))
+                                return Response, true
+                        }
 
-			if first_iter {
-				first_iter = false
-				// if the message is not a reconnect, decrypt the buffer
-				Header.Data.DecryptBuffer(Agent.Encryption.AESKey, Agent.Encryption.AESIv)
-			}
+                        if first_iter {
+                                first_iter = false
+                                // if the message is not a reconnect, decrypt the buffer
+                                Header.Data.DecryptBuffer(Agent.Encryption.AESKey, Agent.Encryption.AESIv)
+                        }
 
-			/* The agent is sending us the result of a task */
-			if Command != agent.COMMAND_GET_JOB {
-				Parser := parser.NewParser(Header.Data.ParseBytes())
-				Agent.TaskDispatch(RequestID, Command, Parser, Teamserver)
-			} else {
-				asked_for_jobs = true
-			}
-		}
+                        /* The agent is sending us the result of a task */
+                        if Command != agent.COMMAND_GET_JOB {
 
-		/* if there is no job then just reply with a COMMAND_NOJOB */
-		if asked_for_jobs == false || len(Agent.JobQueue) == 0 {
-			var NoJob = []agent.Job{{
-				Command: agent.COMMAND_NOJOB,
-				Data:    []interface{}{},
-			}}
+                                Parser := parser.NewParser(Header.Data.ParseBytes())
+                                Agent.TaskDispatch(RequestID, Command, Parser, Teamserver)
+                        } else {
+                                asked_for_jobs = true
+                        }
+                }
 
-			var Payload = agent.BuildPayloadMessage(NoJob, Agent.Encryption.AESKey, Agent.Encryption.AESIv)
 
-			_, err = Response.Write(Payload)
-			if err != nil {
-				logger.Error("Couldn't write to HTTP connection: " + err.Error())
-				return Response, false
-			}
 
-		} else {
-			/* if there is a job then send the Task Queue */
-			var (
-				job     = Agent.GetQueuedJobs()
-				payload = agent.BuildPayloadMessage(job, Agent.Encryption.AESKey, Agent.Encryption.AESIv)
-			)
+                /* if there is no job then just reply with a COMMAND_NOJOB */
+                if asked_for_jobs == false || len(Agent.JobQueue) == 0 {
+                        var NoJob = []agent.Job{{
+                                Command: agent.COMMAND_NOJOB,
+                                Data:    []interface{}{},
+                        }}
 
-			// write the response to the buffer
-			_, err = Response.Write(payload)
-			if err != nil {
-				logger.Error("Couldn't write to HTTP connection: " + err.Error())
-				return Response, false
-			}
+                        var Payload = agent.BuildPayloadMessage(NoJob, Agent.Encryption.AESKey, Agent.Encryption.AESIv)
 
-			// TODO: move this to its own function
-			// show bytes for pivot
-			var CallbackSizes = make(map[uint32][]byte)
-			for j := range job {
+                        _, err = Response.Write(Payload)
+                        if err != nil {
+                                logger.Error("Couldn't write to HTTP connection: " + err.Error())
+                                return Response, false
+                        }
 
-				if len(job[j].Data) >= 1 {
+                } else {
+                        /* if there is a job then send the Task Queue */
+                        var (
+                                job     = Agent.GetQueuedJobs()
+                                payload = agent.BuildPayloadMessage(job, Agent.Encryption.AESKey, Agent.Encryption.AESIv)
+                        )
 
-					switch job[j].Command {
+                        // write the response to the buffer
+                        _, err = Response.Write(payload)
+                        if err != nil {
+                                logger.Error("Couldn't write to HTTP connection: " + err.Error())
+                                return Response, false
+                        }
 
-					case agent.COMMAND_PIVOT:
+                        // TODO: move this to its own function
+                        // show bytes for pivot
+                        var CallbackSizes = make(map[uint32][]byte)
+                        for j := range job {
 
-						if job[j].Data[0] == agent.DEMON_PIVOT_SMB_COMMAND {
+                                if len(job[j].Data) >= 1 {
 
-							var (
-								TaskBuffer    = job[j].Data[2].([]byte)
-								PivotAgentID  = int(job[j].Data[1].(uint32))
-								PivotInstance *agent.Agent
-							)
+                                        switch job[j].Command {
 
-							for {
-								var (
-									Parser       = parser.NewParser(TaskBuffer)
-									CommandID    = 0
-									SubCommandID = 0
-								)
+                                        case agent.COMMAND_PIVOT:
 
-								Parser.SetBigEndian(false)
+                                                if job[j].Data[0] == agent.DEMON_PIVOT_SMB_COMMAND {
 
-								Parser.ParseInt32()
-								Parser.ParseInt32()
+                                                        var (
+                                                                TaskBuffer    = job[j].Data[2].([]byte)
+                                                                PivotAgentID  = int(job[j].Data[1].(uint32))
+                                                                PivotInstance *agent.Agent
+                                                        )
 
-								CommandID = Parser.ParseInt32()
+                                                        for {
+                                                                var (
+                                                                        Parser       = parser.NewParser(TaskBuffer)
+                                                                        CommandID    = 0
+                                                                        SubCommandID = 0
+                                                                )
 
-								// Socks5 over SMB agents yield a CommandID equal to 0
-								if CommandID != agent.COMMAND_PIVOT && CommandID != 0 {
-									//CallbackSizes[uint32(PivotAgentID)] = append(CallbackSizes[job[j].Data[1].(uint32)], TaskBuffer...)
-									break
-								}
+                                                                Parser.SetBigEndian(false)
 
-								/* get an instance of the pivot */
-								PivotInstance = Teamserver.AgentInstance(PivotAgentID)
-								if PivotInstance != nil {
-									break
-								}
+                                                                Parser.ParseInt32()
+                                                                Parser.ParseInt32()
 
-								/* parse the task from the parser */
-								TaskBuffer = Parser.ParseBytes()
+                                                                CommandID = Parser.ParseInt32()
 
-								/* create a new parse for the parsed task */
-								Parser = parser.NewParser(TaskBuffer)
-								Parser.DecryptBuffer(PivotInstance.Encryption.AESKey, PivotInstance.Encryption.AESIv)
+                                                                // Socks5 over SMB agents yield a CommandID equal to 0
+                                                                if CommandID != agent.COMMAND_PIVOT && CommandID != 0 {
+                                                                        //CallbackSizes[uint32(PivotAgentID)] = append(CallbackSizes[job[j].Data[1].(uint32)], TaskBuffer...)
+                                                                        break
+                                                                }
 
-								if Parser.Length() >= 4 {
+                                                                /* get an instance of the pivot */
+                                                                PivotInstance = Teamserver.AgentInstance(PivotAgentID)
+                                                                if PivotInstance != nil {
+                                                                        break
+                                                                }
 
-									SubCommandID = Parser.ParseInt32()
-									SubCommandID = int(bits.ReverseBytes32(uint32(SubCommandID)))
+                                                                /* parse the task from the parser */
+                                                                TaskBuffer = Parser.ParseBytes()
 
-									if SubCommandID == agent.DEMON_PIVOT_SMB_COMMAND {
-										PivotAgentID = Parser.ParseInt32()
-										PivotAgentID = int(bits.ReverseBytes32(uint32(PivotAgentID)))
+                                                                /* create a new parse for the parsed task */
+                                                                Parser = parser.NewParser(TaskBuffer)
+                                                                Parser.DecryptBuffer(PivotInstance.Encryption.AESKey, PivotInstance.Encryption.AESIv)
 
-										TaskBuffer = Parser.ParseBytes()
-										continue
+                                                                if Parser.Length() >= 4 {
 
-									} else {
-										CallbackSizes[uint32(PivotAgentID)] = append(CallbackSizes[job[j].Data[1].(uint32)], TaskBuffer...)
+                                                                        SubCommandID = Parser.ParseInt32()
+                                                                        SubCommandID = int(bits.ReverseBytes32(uint32(SubCommandID)))
 
-										break
-									}
+                                                                        if SubCommandID == agent.DEMON_PIVOT_SMB_COMMAND {
+                                                                                PivotAgentID = Parser.ParseInt32()
+                                                                                PivotAgentID = int(bits.ReverseBytes32(uint32(PivotAgentID)))
 
-								}
+                                                                                TaskBuffer = Parser.ParseBytes()
+                                                                                continue
 
-							}
+                                                                        } else {
+                                                                                CallbackSizes[uint32(PivotAgentID)] = append(CallbackSizes[job[j].Data[1].(uint32)], TaskBuffer...)
 
-						}
+                                                                                break
+                                                                        }
 
-						break
+                                                                }
 
-					case agent.COMMAND_SOCKET:
+                                                        }
 
-						break
+                                                }
 
-					case agent.COMMAND_FS:
+                                                break
 
-						break
+                                        case agent.COMMAND_SOCKET:
 
-					case agent.COMMAND_MEM_FILE:
+                                                break
 
-						break
+                                        case agent.COMMAND_FS:
 
-					default:
-						//logger.Debug("Default")
-						/* build the task payload */
-						payload = agent.BuildPayloadMessage([]agent.Job{job[j]}, Agent.Encryption.AESKey, Agent.Encryption.AESIv)
+                                                break
 
-						/* add the size of the task to the callback size */
-						CallbackSizes[uint32(Header.AgentID)] = append(CallbackSizes[uint32(Header.AgentID)], payload...)
+                                        case agent.COMMAND_MEM_FILE:
 
-						break
+                                                break
 
-					}
+                                        default:
+                                                //logger.Debug("Default")
+                                                /* build the task payload */
+                                                payload = agent.BuildPayloadMessage([]agent.Job{job[j]}, Agent.Encryption.AESKey, Agent.Encryption.AESIv)
 
-				} else {
-					CallbackSizes[uint32(Header.AgentID)] = append(CallbackSizes[uint32(Header.AgentID)], payload...)
-				}
+                                                /* add the size of the task to the callback size */
+                                                CallbackSizes[uint32(Header.AgentID)] = append(CallbackSizes[uint32(Header.AgentID)], payload...)
 
-			}
+                                                break
 
-			for agentID, buffer := range CallbackSizes {
-				Agent = Teamserver.AgentInstance(int(agentID))
-				if Agent != nil {
-					Teamserver.AgentCallbackSize(Agent, len(buffer))
-				}
-			}
+                                        }
 
-			CallbackSizes = nil
-		}
+                                } else {
+                                        CallbackSizes[uint32(Header.AgentID)] = append(CallbackSizes[uint32(Header.AgentID)], payload...)
+                                }
 
-	} else {
-		logger.Debug("Agent does not exists. hope this is a register request")
+                        }
 
-		var (
-			Command = Header.Data.ParseInt32()
-		)
+                        for agentID, buffer := range CallbackSizes {
+                                Agent = Teamserver.AgentInstance(int(agentID))
+                                if Agent != nil {
+                                        Teamserver.AgentCallbackSize(Agent, len(buffer))
+                                }
+                        }
 
-		/* TODO: rework this. */
-		if Command == agent.DEMON_INIT {
-			// RequestID, unused on DEMON_INIT
-			Header.Data.ParseInt32()
+                        CallbackSizes = nil
+                }
 
-			Agent = agent.ParseDemonRegisterRequest(Header.AgentID, Header.Data, ExternalIP)
-			if Agent == nil {
-				return Response, false
-			}
+        } else {
+                logger.Debug("Agent does not exists. hope this is a register request")
 
-			Agent.Info.MagicValue = Header.MagicValue
-			Agent.Info.Listener = nil /* TODO: pass here the listener instance/name */
+                var (
+                        Command = Header.Data.ParseInt32()
+                )
 
-			Teamserver.AgentAdd(Agent)
-			Teamserver.AgentSendNotify(Agent)
 
-			Packer = packer.NewPacker(Agent.Encryption.AESKey, Agent.Encryption.AESIv)
-			Packer.AddUInt32(uint32(Header.AgentID))
 
-			Build = Packer.Build()
+                /* TODO: rework this. */
+                if Command == agent.DEMON_INIT {
+                        // RequestID, unused on DEMON_INIT
+                        Header.Data.ParseInt32()
 
-			_, err = Response.Write(Build)
-			if err != nil {
-				logger.Error(err)
-				return Response, false
-			}
+                        Agent = agent.ParseDemonRegisterRequest(Header.AgentID, Header.Data, ExternalIP)
+                        if Agent == nil {
+                                return Response, false
+                        }
 
-			logger.Debug("Finished request")
-		} else {
-			logger.Debug("Is not register request. bye...")
-			return Response, false
-		}
-	}
+                        Agent.Info.MagicValue = Header.MagicValue
+                        Agent.Info.Listener = nil /* TODO: pass here the listener instance/name */
 
-	return Response, true
+                        Teamserver.AgentAdd(Agent)
+                        Teamserver.AgentSendNotify(Agent)
+
+                        Packer = packer.NewPacker(Agent.Encryption.AESKey, Agent.Encryption.AESIv)
+                        Packer.AddUInt32(uint32(Header.AgentID))
+
+                        Build = Packer.Build()
+
+                        _, err = Response.Write(Build)
+                        if err != nil {
+                                logger.Error(err)
+                                return Response, false
+                        }
+
+                        logger.Debug("Finished request")
+                } else {
+                        logger.Debug("Is not register request. bye...")
+                        return Response, false
+                }
+        }
+
+        return Response, true
 }
 
 // handleServiceAgent
 // handles and parses a service agent request
 // return 2 types:
 //
-//	Response bytes.Buffer
-//	Success  bool
+//      Response bytes.Buffer
+//      Success  bool
 func handleServiceAgent(Teamserver agent.TeamServer, Header agent.Header, ExternalIP string) (bytes.Buffer, bool) {
 
-	var (
-		Response  bytes.Buffer
-		AgentData any
-		Agent     *agent.Agent
-		Task      []byte
-		err       error
-	)
+        var (
+                Response  bytes.Buffer
+                AgentData any
+                Agent     *agent.Agent
+                Task      []byte
+                err       error
+        )
 
-	/* search if a service 3rd party agent was registered with this MagicValue */
-	if !Teamserver.ServiceAgentExist(Header.MagicValue) {
-		return Response, false
-	}
+        /* search if a service 3rd party agent was registered with this MagicValue */
+        if !Teamserver.ServiceAgentExist(Header.MagicValue) {
+                return Response, false
+        }
 
-	Agent = Teamserver.AgentInstance(Header.AgentID)
-	if Agent != nil {
-		AgentData = Agent.ToMap()
-	}
-	
-	// Update Callback time
-	if Teamserver.AgentExist(Header.AgentID) {
-		Agent.UpdateLastCallback(Teamserver)
-	}
-	
-	Task = Teamserver.ServiceAgent(Header.MagicValue).SendResponse(AgentData, Header)
-	//logger.Debug("Response:\n", hex.Dump(Task))
+        Agent = Teamserver.AgentInstance(Header.AgentID)
+        if Agent != nil {
+                AgentData = Agent.ToMap()
+        }
 
-	_, err = Response.Write(Task)
-	if err != nil {
-		return Response, false
-	}
+        // Update Callback time
+        if Teamserver.AgentExist(Header.AgentID) {
+                Agent.UpdateLastCallback(Teamserver)
+        }
 
-	return Response, true
+        Task = Teamserver.ServiceAgent(Header.MagicValue).SendResponse(AgentData, Header)
+        //logger.Debug("Response:\n", hex.Dump(Task))
+
+        _, err = Response.Write(Task)
+        if err != nil {
+                return Response, false
+        }
+
+        return Response, true
 }
 
 // notifyTaskSize
