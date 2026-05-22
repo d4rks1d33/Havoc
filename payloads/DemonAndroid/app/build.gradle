@@ -1,0 +1,70 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.plugin.serialization'
+}
+
+android {
+    namespace 'com.demon.agent'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.demon.agent"   // overridden at build time via resValue
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+
+        // C2 config — injected at build time by the teamserver builder
+        // e.g. gradlew assembleRelease -PCONFIG_HOST=192.168.1.1 -PCONFIG_PORT=443
+        def host = project.findProperty("CONFIG_HOST") ?: "127.0.0.1"
+        def port = project.findProperty("CONFIG_PORT") ?: "80"
+        def uri  = project.findProperty("CONFIG_URI")  ?: "/"
+        def ssl  = project.findProperty("CONFIG_SSL")  ?: "false"
+        def pkg  = project.findProperty("CONFIG_PKG")  ?: "com.demon.agent"
+        def ua   = project.findProperty("CONFIG_UA") ?:
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36"
+
+        applicationId pkg
+
+        buildConfigField "String",  "C2_HOST", "\"$host\""
+        buildConfigField "int",     "C2_PORT", "$port"
+        buildConfigField "String",  "C2_URI",  "\"$uri\""
+        buildConfigField "boolean", "C2_SSL",  "$ssl"
+        buildConfigField "String",  "C2_UA",   "\"${ua.replace('"', '\\"')}\""
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'),
+                          'proguard-rules.pro'
+            signingConfig signingConfigs.debug   // self-signed for red team use
+        }
+        debug {
+            debuggable true
+            minifyEnabled false
+        }
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+
+    packaging { resources { excludes += '/META-INF/{AL2.0,LGPL2.1}' } }
+}
+
+dependencies {
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+    implementation 'org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.2'
+    implementation 'org.bouncycastle:bcprov-jdk18on:1.78.1'
+    implementation 'androidx.core:core-ktx:1.12.0'
+}

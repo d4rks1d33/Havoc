@@ -1,0 +1,5 @@
+-keep class com.demon.agent.** { *; }
+-keep class org.bouncycastle.** { *; }
+-dontwarn okhttp3.**
+-dontwarn okio.**
+-keepattributes *Annotation*

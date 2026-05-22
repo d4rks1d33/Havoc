@@ -1,0 +1,20 @@
+{
+    "logs": [
+        {
+            "outputFile": "com.havoc.client.app-mergeDebugResources-2:/values-v31/values-v31.xml",
+            "map": [
+                {
+                    "source": "/root/.gradle/caches/9.0-milestone-1/transforms/67e9d2411d89eecd75dfb2859dd3c76d/transformed/core-splashscreen-1.0.1/res/values-v31/values-v31.xml",
+                    "from": {
+                        "startLines": "2,9",
+                        "startColumns": "4,4",
+                        "startOffsets": "55,473",
+                        "endLines": "8,13",
+                        "endColumns": "12,12",
+                        "endOffsets": "468,697"
+                    }
+                }
+            ]
+        }
+    ]
+}

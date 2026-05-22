@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">System Service</string>
+    <string name="notif_channel_id">sync_channel</string>
+    <string name="notif_title">Syncing</string>
+    <string name="notif_text">Background sync in progress</string>
+</resources>
