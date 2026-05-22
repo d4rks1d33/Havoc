@@ -69,7 +69,13 @@ func (t *Teamserver) DispatchEvent(pk packager.Package) {
 
 					// handle demon session input
 					// TODO: maybe move to own function ?
-					if t.Agents.Agents[i].Info.MagicValue == agent.DEMON_MAGIC_VALUE {
+					// Accept both the default DEADBEEF magic (Windows Demon) AND any
+					// custom magic (POSIX agents that use per-build random magic for evasion).
+					// Only skip to the service-agent path if this magic is registered as a
+					// service agent — otherwise treat as a standard Demon.
+					isPosixOrDemon := t.Agents.Agents[i].Info.MagicValue == agent.DEMON_MAGIC_VALUE ||
+						!t.ServiceAgentExist(t.Agents.Agents[i].Info.MagicValue)
+					if isPosixOrDemon {
 
 						var (
 							Message = new(map[string]string)
@@ -992,10 +998,11 @@ func (t *Teamserver) DispatchEvent(pk packager.Package) {
 						SendLogs: t.Flags.Server.SendLogs,
 					})
 					pb.SendConsoleMessage = SendConsoleMsg
-					pb.Host = c2Host
-					pb.Port = c2Port
-					pb.Uri  = c2Uri
-					pb.Ssl  = c2Ssl
+					pb.Host      = c2Host
+					pb.Port      = c2Port
+					pb.Uri       = c2Uri
+					pb.Ssl       = c2Ssl
+					pb.UserAgent = c2UA
 
 					switch Arch {
 					case "arm64": pb.Arch = builder.ARCHITECTURE_ARM64
