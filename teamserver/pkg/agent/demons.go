@@ -532,6 +532,28 @@ func (a *Agent) TaskPrepare(Command int, Info any, Message *map[string]string, C
 			ProcArgs, _ := base64.StdEncoding.DecodeString(Args[4])
 			ProcessArgs = string(ProcArgs)
 
+			// ── POSIX adaptation ──────────────────────────────────────────
+			// For macOS, Linux and Android agents the Windows cmd.exe-style
+			// invocation doesn't apply. Replace with sh -c <actualCmd>.
+			// The desktop client always sends:
+			//   Process = "c:\windows\system32\cmd.exe"
+			//   ProcessArgs = "/c <actual command>"
+			// For POSIX we use "sh" as the process and strip the "/c " prefix
+			// so the agent just runs the actual command directly.
+			osVer := a.Info.OSVersion
+			isPosix := strings.HasPrefix(osVer, "Linux") ||
+				strings.HasPrefix(osVer, "macOS") ||
+				strings.HasPrefix(osVer, "MacOS") ||
+				strings.HasPrefix(osVer, "Android")
+
+			if isPosix {
+				// For POSIX targets: the agent handles stripping "/c " prefix
+				// and running via sh. Just mark the process as "sh" so the
+				// agent knows to use the POSIX path. The args ("/c <cmd>")
+				// are decoded by CmdProcCreate which strips the prefix.
+				Process = "sh"
+			}
+
 			job.Data = []interface{}{
 				SubCommand,
 				ProcessState,
