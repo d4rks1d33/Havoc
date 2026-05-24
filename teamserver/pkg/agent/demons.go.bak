@@ -2455,17 +2455,7 @@ func (a *Agent) TaskDispatch(RequestID uint32, CommandID uint32, Parser *parser.
 
 				}
 
-				// OsVersion[4] = osType: 0=Windows, 2=macOS, 3=Linux, 4=Android
-				switch OsVersion[4] {
-				case 4:
-					a.Info.OSVersion = fmt.Sprintf("Android %d (API %d)", OsVersion[0], OsVersion[1])
-				case 3:
-					a.Info.OSVersion = fmt.Sprintf("Linux %d.%d", OsVersion[0], OsVersion[1])
-				case 2:
-					a.Info.OSVersion = fmt.Sprintf("macOS %d.%d", OsVersion[0], OsVersion[1])
-				default:
-					a.Info.OSVersion = getWindowsVersionString(OsVersion)
-				}
+				a.Info.OSVersion = getWindowsVersionString(OsVersion)
 
 				switch OsArch {
 				case 0:
