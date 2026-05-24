@@ -252,7 +252,8 @@ func (pb *PosixBuilder) Build() bool {
 	if isLinux {
 		// zig cc + musl: pthread is bundled, no curl needed (raw socket transport)
 		// -static produces a fully static binary with zero runtime dependencies
-		args = append(args, "-static")
+		//args = append(args, "-static")
+                args = append(args, "-Wl,-z,relro,-z,now", "-pie", "-lssl", "-lcrypto")
 	} else {
 		// macOS: use system libcurl (always available) + CoreFoundation
 		args = append(args, "-lcurl", "-lpthread")

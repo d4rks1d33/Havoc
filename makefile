@@ -16,13 +16,13 @@ ts-build:
 
 dev-ts-compile:
 	@ echo "[*] compile teamserver"
-	@ cd teamserver; GO111MODULE="on" go build -ldflags="-s -w -X cmd.VersionCommit=$(git rev-parse HEAD)" -o ../havoc main.go 
+	@ cd teamserver; GO111MODULE="on" go build -ldflags="-s -w -X cmd.VersionCommit=$(git rev-parse HEAD)" -o ../havoc main.go
 
-ts-cleanup: 
+ts-cleanup:
 	@ echo "[*] teamserver cleanup"
 	@ rm -rf ./teamserver/bin
 	@ rm -rf ./data/loot
-	@ rm -rf ./data/x86_64-w64-mingw32-cross 
+	@ rm -rf ./data/x86_64-w64-mingw32-cross
 	@ rm -rf ./data/havoc.db
 	@ rm -rf ./data/server.*
 	@ rm -rf ./teamserver/.idea
@@ -39,7 +39,7 @@ client-build:
 	  else \
 	      cd client/Build && cmake ..; \
 	  fi
-	@ if [ -d "client/Modules" ]; then echo "Modules installed"; else git clone https://github.com/HavocFramework/Modules client/Modules --single-branch --branch `git rev-parse --abbrev-ref HEAD`; fi
+	@ if [ -d "client/Modules" ]; then echo "Modules installed"; else git clone https://github.com/HavocFramework/Modules client/Modules --single-branch --branch main; fi
 	@ cmake --build client/Build -- -j 4
 
 client-cleanup:
@@ -53,7 +53,7 @@ client-cleanup:
 	@ rm -rf ./client/Modules
 
 
-# cleanup target 
+# cleanup target
 clean: ts-cleanup client-cleanup
 	@ rm -rf ./data/*.db
 	@ rm -rf payloads/Demon/.idea
