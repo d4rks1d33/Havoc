@@ -3,9 +3,9 @@ Teamserver {
     Port = 40056
 
     Build {
-        Compiler64 = "/usr/bin/x86_64-w64-mingw32-gcc"
-        Compiler86 = "/usr/bin/i686-w64-mingw32-gcc"
-        Nasm = "/usr/bin/nasm"
+        Compiler64 = "/opt/homebrew/bin/x86_64-w64-mingw32-gcc"
+        Compiler86 = "/opt/homebrew/bin/i686-w64-mingw32-gcc"
+        Nasm = "/opt/homebrew/bin/nasm"
     }
 }
 
@@ -37,7 +37,6 @@ Demon {
     }
 }
 
-
 # LLM Agent configuration
 # Uncomment and fill in to enable the 'llm' command in agent consoles.
 # The LLM runs on the teamserver side and autonomously executes commands
@@ -48,6 +47,7 @@ Demon {
      ApiKey   = ""
      Model    = "" # model name for the chosen provider
      BaseUrl  = ""               # optional: custom base URL (required for ollama/openrouter)
-     MaxSteps = 40               # max iterations before stopping
+     MaxSteps = 20               # max iterations before stopping
      MaxTokens = 4096            # max tokens per LLM response
  }
+

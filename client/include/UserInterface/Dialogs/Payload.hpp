@@ -56,6 +56,7 @@ public:
     QSpacerItem*    horizontalSpacer_7;
 
     QString         TeamserverName;
+    QString         SourceApkPath;   // path to victim APK for "Android APK Inject"
 
     auto setupUi( QDialog* StagelessDialog ) -> void;
     auto retranslateUi() -> void;
@@ -67,6 +68,7 @@ public:
     auto AddConfigFromJson( QJsonDocument JsonConfig ) -> void;
     auto DefaultConfig() -> void;
     auto PosixDefaultConfig() -> void;
+    auto AndroidInjectConfig() -> void;
 
     auto GetConfigAsJson() -> QJsonDocument;
 

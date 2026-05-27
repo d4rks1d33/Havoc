@@ -88,7 +88,8 @@ If you run into issues, check the [Known Issues](https://github.com/HavocFramewo
 | macOS Dylib | x64, arm64 | Dynamic library |
 | Android Exe | arm64, x64 | Static ELF runs on Android without NDK |
 | Android SO | arm64, x64 | Shared library for Android injection |
-| Android APK | arm64 | Full APK via DemonAndroid (see below) |
+| Android APK | arm64 | Standalone APK via DemonAndroid Gradle build |
+| Android APK Inject | arm64 | Agent injected into an existing victim APK |
 
 #### DemonAndroid (Android APK)
 
@@ -104,6 +105,44 @@ If you run into issues, check the [Known Issues](https://github.com/HavocFramewo
 - C2 host/port/URI/SSL baked in at build time via Gradle `-P` properties
 
 **Session table shows:** `Android 14 (API 34)` in the OS column
+
+#### Android APK Injector
+
+> Repackages an existing victim APK (any app) with the DemonAndroid agent embedded inside
+
+The APK injector lets you take any legitimate APK — a game, a utility, a social media app — and inject the agent into it. The resulting APK looks and behaves exactly like the original app while running the agent silently in the background.
+
+**How it works:**
+
+1. **Build a debug stub** — compiles DemonAndroid with your C2 config (`assembleDebug` to keep class names unobfuscated)
+2. **Decompile both APKs** — `apktool d` on both the stub and the victim, producing smali source
+3. **Merge smali** — copies the agent's smali dirs into the victim as new `smali_classesN` DEX slots (appended, never overwriting victim code)
+4. **Patch `AndroidManifest.xml`** — injects required permissions (`INTERNET`, `FOREGROUND_SERVICE`, `RECEIVE_BOOT_COMPLETED`) and declares `AgentService` + `BootReceiver` components. The original binary manifest is removed so apktool recompiles from the patched text version
+5. **Hook entry point** — injects a static `AgentBoot.start(Context)` call into the victim's `onCreate()` so the service starts the moment the app is opened. Uses `invoke-static/range` (format3rc) to avoid Dalvik's v15 register cap. Fallback chain: Application class → Launcher Activity → any Activity
+6. **Recompile + sign** — `apktool b` rebuilds the APK; `apksigner` signs it with a generated debug keystore
+
+**Usage — from the Payload dialog:**
+
+1. Select agent type `DemonPosix`, format `Android APK Inject`
+2. Set `PackageName` (the internal agent package, e.g. `com.demon.agent`)
+3. Click **Browse** next to "Source APK" and select the victim APK
+4. Click **Generate** — the teamserver runs the full pipeline and delivers `injected.apk`
+5. Install with `adb install injected.apk` (you may need `--allow-test-keys` for some devices)
+
+**Compatibility:**
+
+- Works with any APK that has a standard `AndroidManifest.xml` (virtually all apps)
+- Tested on APKs with up to 19 DEX files (multi-dex); no theoretical limit
+- Hook fallback chain handles apps with no custom Application class
+- `invoke-static/range` handles Application classes with large local register counts (> v15)
+
+**Dependencies** (see [Installation](#installation) for full setup instructions):
+
+```
+apktool    — APK decompile/recompile
+apksigner  — APK signing (bundled with Android SDK build-tools)
+Java 17+   — required by apktool
+```
 
 <div align="center">
   <img src="assets/Screenshots/SessionConsoleHelp.png" width="90%" /><br />
@@ -124,9 +163,23 @@ If you run into issues, check the [Known Issues](https://github.com/HavocFramewo
 #### Linux (Debian/Ubuntu/Kali)
 
 ```bash
-# Install dependencies
+# Core dependencies
 sudo apt install -y golang-go nasm mingw-w64 python3-dev libqt5websockets5-dev \
   qtbase5-dev qt5-qmake cmake
+
+# Optional — for cross-compiling Linux/Android ELF agents (DemonPosix):
+# (zig is available via snap or from https://ziglang.org/download/)
+snap install zig --classic --beta
+
+# Optional — for Android APK builder (DemonAndroid):
+# Install Android SDK (e.g. via Android Studio or command-line tools)
+# Then:
+sdkmanager "build-tools;34.0.0" "platforms;android-34"
+# Java 17 is required by Gradle 8:
+sudo apt install -y openjdk-17-jdk
+
+# Optional — for Android APK Injector (requires the above + apktool):
+sudo apt install -y apktool
 
 # Clone and build
 git clone https://github.com/HavocFramework/Havoc
@@ -137,16 +190,20 @@ make         # builds both teamserver and client
 #### macOS (Apple Silicon & Intel)
 
 ```bash
-# Install dependencies via Homebrew
+# Core dependencies
 brew install qt@5 golang nasm mingw-w64 cmake python3
 
-# Optional — for cross-compiling Linux/Android agents:
+# Optional — for cross-compiling Linux/Android ELF agents (DemonPosix):
 brew install zig
 
-# Optional — for Android APK generation:
+# Optional — for Android APK builder (DemonAndroid):
 brew install --cask android-commandlinetools
 brew install openjdk@17
 sdkmanager "build-tools;34.0.0" "platforms;android-34"
+
+# Optional — for Android APK Injector (requires the above + apktool):
+brew install apktool
+# apksigner is bundled with build-tools;34.0.0 installed above
 
 # Clone and build
 git clone https://github.com/HavocFramework/Havoc
@@ -158,6 +215,15 @@ make               # both
 
 > The macOS build uses Homebrew's `mingw-w64` for cross-compiling the Windows Demon agent.
 > The profile at `profiles/havoc.yaotl` is pre-configured for Homebrew paths.
+
+**Dependency summary by feature:**
+
+| Feature | Required tools |
+|---------|---------------|
+| Windows Demon | `nasm`, `mingw-w64` |
+| DemonPosix (Linux/macOS) | `zig` |
+| DemonAndroid APK build | Android SDK, `build-tools;34.0.0`, `platforms;android-34`, Java 17 |
+| **Android APK Injector** | All of the above + `apktool` |
 
 #### Android Client (Operator App)
 
@@ -173,7 +239,8 @@ Requirements: Android Studio Hedgehog+, Android SDK 34, minSdk 26.
 |-------|---------|-----------|-------|
 | Demon | Windows x64/x86 | HTTP/HTTPS, SMB | Original flagship agent |
 | DemonPosix | Linux x64/arm64, macOS x64/arm64 | HTTP/HTTPS | Static musl build via `zig cc`; libcurl on macOS |
-| DemonAndroid | Android arm64/x64 | HTTP/HTTPS | APK; ForegroundService; persists on reboot |
+| DemonAndroid | Android arm64/x64 | HTTP/HTTPS | Standalone APK; ForegroundService; persists on reboot |
+| DemonAndroid (Injected) | Android arm64/x64 | HTTP/HTTPS | Agent embedded in any existing APK via smali injection |
 
 ---
 
